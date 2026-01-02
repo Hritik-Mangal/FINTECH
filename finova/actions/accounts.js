@@ -1,150 +1,128 @@
 "use server";
 
-import { db } from "@/lib/prisma";
+import { supabase } from "../lib/supabase";
 import { auth } from "@clerk/nextjs/server";
 import { revalidatePath } from "next/cache";
 
-const serializeDecimal = (obj) => {
-  const serialized = { ...obj };
-  if (obj.balance) {
-    serialized.balance = obj.balance.toNumber();
-  }
-  if (obj.amount) {
-    serialized.amount = obj.amount.toNumber();
-  }
-  return serialized;
-};
-
 export async function getAccountWithTransactions(accountId) {
-  const { userId } = await auth();
-  if (!userId) throw new Error("Unauthorized");
+  try {
+    const { userId: clerkUserId } = await auth();
+    if (!clerkUserId) return null;
 
-  const user = await db.user.findUnique({
-    where: { clerkUserId: userId },
-  });
+    const { data: user } = await supabase
+      .from("users")
+      .select("id")
+      .eq("clerkUserId", clerkUserId)
+      .maybeSingle();
 
-  if (!user) throw new Error("User not found");
+    if (!user) return null;
 
-  const account = await db.account.findFirst({
-    where: {
-      id: accountId,
-      userId: user.id,
-    },
-    include: {
-      transactions: {
-        orderBy: { date: "desc" },
-      },
+    const { data: account } = await supabase
+      .from("accounts")
+      .select(`*, transactions (*)`)
+      .eq("id", accountId)
+      .eq("userId", user.id)
+      .maybeSingle();
+
+    if (!account) return null;
+
+    account.transactions.sort(
+      (a, b) => new Date(b.date) - new Date(a.date)
+    );
+
+    return {
+      ...account,
       _count: {
-        select: { transactions: true },
+        transactions: account.transactions.length,
       },
-    },
-  });
-
-  if (!account) return null;
-
-  return {
-    ...serializeDecimal(account),
-    transactions: account.transactions.map(serializeDecimal),
-  };
+    };
+  } catch {
+    return null;
+  }
 }
 
 export async function bulkDeleteTransactions(transactionIds) {
   try {
-    const { userId } = await auth();
-    if (!userId) throw new Error("Unauthorized");
+    const { userId: clerkUserId } = await auth();
+    if (!clerkUserId) return { success: false };
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    const { data: user } = await supabase
+      .from("users")
+      .select("id")
+      .eq("clerkUserId", clerkUserId)
+      .maybeSingle();
 
-    if (!user) throw new Error("User not found");
+    if (!user) return { success: false };
 
-    // Get transactions to calculate balance changes
-    const transactions = await db.transaction.findMany({
-      where: {
-        id: { in: transactionIds },
-        userId: user.id,
-      },
-    });
+    const { data: transactions } = await supabase
+      .from("transactions")
+      .select("id, type, amount, accountId")
+      .in("id", transactionIds)
+      .eq("userId", user.id);
 
-    // Group transactions by account to update balances
-    const accountBalanceChanges = transactions.reduce((acc, transaction) => {
-      const change =
-        transaction.type === "EXPENSE"
-          ? transaction.amount
-          : -transaction.amount;
-      acc[transaction.accountId] = (acc[transaction.accountId] || 0) + change;
+    if (!transactions?.length) return { success: true };
+
+    const accountBalanceChanges = transactions.reduce((acc, t) => {
+      const change = t.type === "EXPENSE" ? t.amount : -t.amount;
+      acc[t.accountId] = (acc[t.accountId] || 0) + change;
       return acc;
     }, {});
 
-    // Delete transactions and update account balances in a transaction
-    await db.$transaction(async (tx) => {
-      // Delete transactions
-      await tx.transaction.deleteMany({
-        where: {
-          id: { in: transactionIds },
-          userId: user.id,
-        },
-      });
+    await supabase
+      .from("transactions")
+      .delete()
+      .in("id", transactionIds)
+      .eq("userId", user.id);
 
-      // Update account balances
-      for (const [accountId, balanceChange] of Object.entries(
-        accountBalanceChanges
-      )) {
-        await tx.account.update({
-          where: { id: accountId },
-          data: {
-            balance: {
-              increment: balanceChange,
-            },
-          },
-        });
-      }
-    });
+    await Promise.all(
+      Object.entries(accountBalanceChanges).map(([accountId, balanceChange]) =>
+        supabase.rpc("increment_account_balance", {
+          account_id: accountId,
+          balance_change: balanceChange,
+        })
+      )
+    );
 
     revalidatePath("/dashboard");
     revalidatePath("/account/[id]");
 
     return { success: true };
-  } catch (error) {
-    return { success: false, error: error.message };
+  } catch {
+    return { success: false };
   }
 }
 
 export async function updateDefaultAccount(accountId) {
   try {
-    const { userId } = await auth();
-    if (!userId) throw new Error("Unauthorized");
+    const { userId: clerkUserId } = await auth();
+    if (!clerkUserId) return { success: false };
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    const { data: user } = await supabase
+      .from("users")
+      .select("id")
+      .eq("clerkUserId", clerkUserId)
+      .maybeSingle();
 
-    if (!user) {
-      throw new Error("User not found");
-    }
+    if (!user) return { success: false };
 
-    // First, unset any existing default account
-    await db.account.updateMany({
-      where: {
-        userId: user.id,
-        isDefault: true,
-      },
-      data: { isDefault: false },
-    });
+    await supabase
+      .from("accounts")
+      .update({ isDefault: false })
+      .eq("userId", user.id)
+      .eq("isDefault", true);
 
-    // Then set the new default account
-    const account = await db.account.update({
-      where: {
-        id: accountId,
-        userId: user.id,
-      },
-      data: { isDefault: true },
-    });
+    const { data: account } = await supabase
+      .from("accounts")
+      .update({ isDefault: true })
+      .eq("id", accountId)
+      .eq("userId", user.id)
+      .select()
+      .maybeSingle();
 
     revalidatePath("/dashboard");
-    return { success: true, data: serializeTransaction(account) };
-  } catch (error) {
-    return { success: false, error: error.message };
+
+    return { success: true, data: account };
+  } catch {
+    return { success: false };
   }
 }

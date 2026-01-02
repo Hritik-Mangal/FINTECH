@@ -1,7 +1,7 @@
 "use server";
 
 import { auth } from "@clerk/nextjs/server";
-import { db } from "@/lib/prisma";
+import { supabase } from "../lib/supabase";
 import { revalidatePath } from "next/cache";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import aj from "@/lib/arcjet";
@@ -11,230 +11,202 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const serializeAmount = (obj) => ({
   ...obj,
-  amount: obj.amount.toNumber(),
+  amount: obj.amount,
 });
 
-// Create Transaction
 export async function createTransaction(data) {
-  try {
-    const { userId } = await auth();
-    if (!userId) throw new Error("Unauthorized");
+  const { userId: clerkUserId } = await auth();
+  if (!clerkUserId) return { success: false, error: "Unauthorized" };
 
-    // Get request data for ArcJet
+  try {
     const req = await request();
 
-    // Check rate limit
     const decision = await aj.protect(req, {
-      userId,
-      requested: 1, // Specify how many tokens to consume
+      userId: clerkUserId,
+      requested: 1,
     });
 
     if (decision.isDenied()) {
       if (decision.reason.isRateLimit()) {
-        const { remaining, reset } = decision.reason;
-        console.error({
-          code: "RATE_LIMIT_EXCEEDED",
-          details: {
-            remaining,
-            resetInSeconds: reset,
-          },
-        });
-
-        throw new Error("Too many requests. Please try again later.");
+        return { success: false, error: "Too many requests. Try again later." };
       }
-
-      throw new Error("Request blocked");
+      return { success: false, error: "Request blocked" };
     }
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    const { data: user } = await supabase
+      .from("users")
+      .select("id")
+      .eq("clerkUserId", clerkUserId)
+      .maybeSingle();
 
-    if (!user) {
-      throw new Error("User not found");
-    }
+    if (!user) return { success: false, error: "User not found" };
 
-    const account = await db.account.findUnique({
-      where: {
-        id: data.accountId,
+    const { data: account } = await supabase
+      .from("accounts")
+      .select("id")
+      .eq("id", data.accountId)
+      .eq("userId", user.id)
+      .maybeSingle();
+
+    if (!account) return { success: false, error: "Account not found" };
+
+    const balanceChange =
+      data.type === "EXPENSE" ? -data.amount : data.amount;
+
+    const nextRecurringDate =
+      data.isRecurring && data.recurringInterval
+        ? calculateNextRecurringDate(data.date, data.recurringInterval)
+        : null;
+
+    const { data: transaction, error: insertError } = await supabase
+      .from("transactions")
+      .insert({
+        ...data,
         userId: user.id,
-      },
-    });
+        nextRecurringDate,
+      })
+      .select()
+      .single();
 
-    if (!account) {
-      throw new Error("Account not found");
+    if (insertError) {
+      return { success: false, error: insertError.message };
     }
 
-    // Calculate new balance
-    const balanceChange = data.type === "EXPENSE" ? -data.amount : data.amount;
-    const newBalance = account.balance.toNumber() + balanceChange;
-
-    // Create transaction and update account balance
-    const transaction = await db.$transaction(async (tx) => {
-      const newTransaction = await tx.transaction.create({
-        data: {
-          ...data,
-          userId: user.id,
-          nextRecurringDate:
-            data.isRecurring && data.recurringInterval
-              ? calculateNextRecurringDate(data.date, data.recurringInterval)
-              : null,
-        },
-      });
-
-      await tx.account.update({
-        where: { id: data.accountId },
-        data: { balance: newBalance },
-      });
-
-      return newTransaction;
+    await supabase.rpc("increment_account_balance", {
+      account_id: data.accountId,
+      balance_change: balanceChange,
     });
 
     revalidatePath("/dashboard");
-    revalidatePath(`/account/₹{transaction.accountId}`);
+    revalidatePath(`/account/${transaction.accountId}`);
 
     return { success: true, data: serializeAmount(transaction) };
-  } catch (error) {
-    throw new Error(error.message);
+  } catch {
+    return { success: false, error: "Failed to create transaction" };
   }
 }
 
 export async function getTransaction(id) {
-  const { userId } = await auth();
-  if (!userId) throw new Error("Unauthorized");
+  const { userId: clerkUserId } = await auth();
+  if (!clerkUserId) return null;
 
-  const user = await db.user.findUnique({
-    where: { clerkUserId: userId },
-  });
+  const { data: user } = await supabase
+    .from("users")
+    .select("id")
+    .eq("clerkUserId", clerkUserId)
+    .maybeSingle();
 
-  if (!user) throw new Error("User not found");
+  if (!user) return null;
 
-  const transaction = await db.transaction.findUnique({
-    where: {
-      id,
-      userId: user.id,
-    },
-  });
+  const { data: transaction } = await supabase
+    .from("transactions")
+    .select("*")
+    .eq("id", id)
+    .eq("userId", user.id)
+    .maybeSingle();
 
-  if (!transaction) throw new Error("Transaction not found");
+  if (!transaction) return null;
 
   return serializeAmount(transaction);
 }
 
 export async function updateTransaction(id, data) {
+  const { userId: clerkUserId } = await auth();
+  if (!clerkUserId) return { success: false, error: "Unauthorized" };
+
   try {
-    const { userId } = await auth();
-    if (!userId) throw new Error("Unauthorized");
+    const { data: user } = await supabase
+      .from("users")
+      .select("id")
+      .eq("clerkUserId", clerkUserId)
+      .maybeSingle();
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    if (!user) return { success: false, error: "User not found" };
 
-    if (!user) throw new Error("User not found");
+    const { data: original } = await supabase
+      .from("transactions")
+      .select("type, amount, accountId")
+      .eq("id", id)
+      .eq("userId", user.id)
+      .maybeSingle();
 
-    // Get original transaction to calculate balance change
-    const originalTransaction = await db.transaction.findUnique({
-      where: {
-        id,
-        userId: user.id,
-      },
-      include: {
-        account: true,
-      },
-    });
+    if (!original) {
+      return { success: false, error: "Transaction not found" };
+    }
 
-    if (!originalTransaction) throw new Error("Transaction not found");
+    const oldChange =
+      original.type === "EXPENSE" ? -original.amount : original.amount;
 
-    // Calculate balance changes
-    const oldBalanceChange =
-      originalTransaction.type === "EXPENSE"
-        ? -originalTransaction.amount.toNumber()
-        : originalTransaction.amount.toNumber();
-
-    const newBalanceChange =
+    const newChange =
       data.type === "EXPENSE" ? -data.amount : data.amount;
 
-    const netBalanceChange = newBalanceChange - oldBalanceChange;
+    const netChange = newChange - oldChange;
 
-    // Update transaction and account balance in a transaction
-    const transaction = await db.$transaction(async (tx) => {
-      const updated = await tx.transaction.update({
-        where: {
-          id,
-          userId: user.id,
-        },
-        data: {
-          ...data,
-          nextRecurringDate:
-            data.isRecurring && data.recurringInterval
-              ? calculateNextRecurringDate(data.date, data.recurringInterval)
-              : null,
-        },
-      });
+    const nextRecurringDate =
+      data.isRecurring && data.recurringInterval
+        ? calculateNextRecurringDate(data.date, data.recurringInterval)
+        : null;
 
-      // Update account balance
-      await tx.account.update({
-        where: { id: data.accountId },
-        data: {
-          balance: {
-            increment: netBalanceChange,
-          },
-        },
-      });
+    const { data: updated, error } = await supabase
+      .from("transactions")
+      .update({
+        ...data,
+        nextRecurringDate,
+      })
+      .eq("id", id)
+      .eq("userId", user.id)
+      .select()
+      .single();
 
-      return updated;
+    if (error) {
+      return { success: false, error: error.message };
+    }
+
+    await supabase.rpc("increment_account_balance", {
+      account_id: data.accountId,
+      balance_change: netChange,
     });
 
     revalidatePath("/dashboard");
-    revalidatePath(`/account/₹{data.accountId}`);
+    revalidatePath(`/account/${data.accountId}`);
 
-    return { success: true, data: serializeAmount(transaction) };
-  } catch (error) {
-    throw new Error(error.message);
+    return { success: true, data: serializeAmount(updated) };
+  } catch {
+    return { success: false, error: "Failed to update transaction" };
   }
 }
 
-// Get User Transactions
 export async function getUserTransactions(query = {}) {
-  try {
-    const { userId } = await auth();
-    if (!userId) throw new Error("Unauthorized");
+  const { userId: clerkUserId } = await auth();
+  if (!clerkUserId) return { success: false, data: [] };
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+  const { data: user } = await supabase
+    .from("users")
+    .select("id")
+    .eq("clerkUserId", clerkUserId)
+    .maybeSingle();
 
-    if (!user) {
-      throw new Error("User not found");
-    }
+  if (!user) return { success: false, data: [] };
 
-    const transactions = await db.transaction.findMany({
-      where: {
-        userId: user.id,
-        ...query,
-      },
-      include: {
-        account: true,
-      },
-      orderBy: {
-        date: "desc",
-      },
-    });
+  let q = supabase
+    .from("transactions")
+    .select("*, account:accounts(*)")
+    .eq("userId", user.id)
+    .order("date", { ascending: false });
 
-    return { success: true, data: transactions };
-  } catch (error) {
-    throw new Error(error.message);
-  }
+  Object.entries(query).forEach(([k, v]) => {
+    q = q.eq(k, v);
+  });
+
+  const { data } = await q;
+  return { success: true, data: data || [] };
 }
 
-// Scan Receipt
 export async function scanReceipt(file) {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-    // Convert File to ArrayBuffer
     const arrayBuffer = await file.arrayBuffer();
-    // Convert ArrayBuffer to Base64
     const base64String = Buffer.from(arrayBuffer).toString("base64");
 
     const prompt = `
@@ -267,47 +239,36 @@ export async function scanReceipt(file) {
       prompt,
     ]);
 
-    const response = await result.response;
-    const text = response.text();
+    const text = result.response.text();
     const cleanedText = text.replace(/```(?:json)?\n?/g, "").trim();
 
-    try {
-      const data = JSON.parse(cleanedText);
-      return {
+    const data = JSON.parse(cleanedText);
+
+    // ❌ NOT A RECEIPT
+    if (!data || Object.keys(data).length === 0) {
+      throw new Error("Not a valid receipt");
+    }
+
+    return {
         amount: parseFloat(data.amount),
         date: new Date(data.date),
         description: data.description,
         category: data.category,
         merchantName: data.merchantName,
-      };
-    } catch (parseError) {
-      console.error("Error parsing JSON response:", parseError);
-      throw new Error("Invalid response format from Gemini");
-    }
+      };  
   } catch (error) {
     console.error("Error scanning receipt:", error);
-    throw new Error("Failed to scan receipt");
+    throw error; // IMPORTANT: let UI handle toast
   }
 }
 
-// Helper function to calculate next recurring date
+
+
 function calculateNextRecurringDate(startDate, interval) {
   const date = new Date(startDate);
-
-  switch (interval) {
-    case "DAILY":
-      date.setDate(date.getDate() + 1);
-      break;
-    case "WEEKLY":
-      date.setDate(date.getDate() + 7);
-      break;
-    case "MONTHLY":
-      date.setMonth(date.getMonth() + 1);
-      break;
-    case "YEARLY":
-      date.setFullYear(date.getFullYear() + 1);
-      break;
-  }
-
+  if (interval === "DAILY") date.setDate(date.getDate() + 1);
+  if (interval === "WEEKLY") date.setDate(date.getDate() + 7);
+  if (interval === "MONTHLY") date.setMonth(date.getMonth() + 1);
+  if (interval === "YEARLY") date.setFullYear(date.getFullYear() + 1);
   return date;
 }

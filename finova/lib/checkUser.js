@@ -1,37 +1,56 @@
 import { currentUser } from "@clerk/nextjs/server";
-import { db } from "./prisma";
+import { supabaseServer } from "@/lib/supabase-server";
 
 export const checkUser = async () => {
   const user = await currentUser();
+  if (!user) return null;
 
-  if (!user) {
-    return null;
-  }
+  const clerkUserId = user.id;
+  const email = user.emailAddresses[0].emailAddress.toLowerCase().trim();
+  const name = `${user.firstName ?? ""} ${user.lastName ?? ""}`.trim();
+  const imageUrl = user.imageUrl;
 
-  try {
-    const loggedInUser = await db.user.findUnique({
-      where: {
-        clerkUserId: user.id,
-      },
-    });
+  const { data: byClerkId } = await supabaseServer
+    .from("users")
+    .select("*")
+    .eq("clerkUserId", clerkUserId)
+    .maybeSingle();
 
-    if (loggedInUser) {
-      return loggedInUser;
-    }
+  if (byClerkId) return byClerkId;
 
-    const name = `${user.firstName} ${user.lastName}`;
+  const { data: byEmail } = await supabaseServer
+    .from("users")
+    .select("*")
+    .eq("email", email)
+    .maybeSingle();
 
-    const newUser = await db.user.create({
-      data: {
-        clerkUserId: user.id,
+  if (byEmail) {
+    const { data: updatedUser, error } = await supabaseServer
+      .from("users")
+      .update({
+        clerkUserId,
         name,
-        imageUrl: user.imageUrl,
-        email: user.emailAddresses[0].emailAddress,
-      },
-    });
+        imageUrl,
+      })
+      .eq("id", byEmail.id)
+      .select()
+      .single();
 
-    return newUser;
-  } catch (error) {
-    console.log(error.message);
+    if (error) throw error;
+    return updatedUser;
   }
+
+  const { data: newUser, error } = await supabaseServer
+    .from("users")
+    .insert({
+      clerkUserId,
+      email,
+      name,
+      imageUrl,
+    })
+    .select()
+    .single();
+
+  if (error) throw error;
+  return newUser;
 };
