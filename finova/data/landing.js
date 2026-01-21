@@ -90,7 +90,7 @@ export const testimonialsData = [
   {
   name: "Saurav Kumar Srivastava",
   role: "Bridge Designer",
-  image: "https://randomuser.me/api/portraits/men/75.jpg",
+  image: "/saurav_srivastava.jpeg",
   quote:
     "Handling multiple project budgets and vendor payments used to be messy. Finova helped me track expenses precisely and plan cash flow better across long-term infrastructure projects.",
 },
