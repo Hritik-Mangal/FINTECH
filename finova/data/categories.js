@@ -54,7 +54,7 @@ export const defaultCategories = [
   },
   {
     id: "transportation",
-    name: "Transportation",
+    name: "Transportation/Travel",
     type: "EXPENSE",
     color: "#f97316", // orange-500
     icon: "Car",
@@ -123,11 +123,12 @@ export const defaultCategories = [
     subcategories: ["Haircut", "Gym", "Beauty"],
   },
   {
-    id: "travel",
-    name: "Travel",
+    id: "investment",
+    name: "Investment",
     type: "EXPENSE",
     color: "#0ea5e9", // sky-500
-    icon: "Plane",
+    icon: "TrendingUp",
+    subcategories: ["Stocks", "Bonds", "Real Estate, Mutual Funds"],
   },
   {
     id: "insurance",
